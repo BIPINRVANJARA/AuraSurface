@@ -1,0 +1,38 @@
+{
+  "esp32_host": "omnitouch.local",
+  "esp32_port": 8765,
+  "fallback_host": "127.0.0.1",
+  "reconnect_interval_sec": 3,
+  "haptic_tap_actions": {
+    "SINGLE_TAP": "PLAY_PAUSE",
+    "DOUBLE_TAP": "TOGGLE_MIC_MUTE",
+    "TRIPLE_TAP": "SCREENSHOT"
+  },
+  "voice_commands": {
+    "mute": "TOGGLE_MIC_MUTE",
+    "mute microphone": "TOGGLE_MIC_MUTE",
+    "unmute": "TOGGLE_MIC_MUTE",
+    "play": "PLAY_PAUSE",
+    "pause": "PLAY_PAUSE",
+    "next song": "NEXT_TRACK",
+    "next track": "NEXT_TRACK",
+    "next": "NEXT_TRACK",
+    "previous song": "PREV_TRACK",
+    "previous track": "PREV_TRACK",
+    "volume up": "VOLUME_UP",
+    "volume down": "VOLUME_DOWN",
+    "screenshot": "SCREENSHOT",
+    "movie mode": "MOVIE_MODE",
+    "study mode": "STUDY_MODE"
+  },
+  "scenes": {
+    "MOVIE_MODE": {
+      "name": "Movie Mode",
+      "actions": ["VOLUME_60", "FULLSCREEN"]
+    },
+    "STUDY_MODE": {
+      "name": "Study Mode",
+      "actions": ["VOLUME_30", "FOCUS_BROWSER"]
+    }
+  }
+}
