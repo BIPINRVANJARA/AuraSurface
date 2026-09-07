@@ -27,8 +27,8 @@
 // =============================================================================
 // User Configuration
 // =============================================================================
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";     // Change to your Wi-Fi SSID
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"; // Change to your Wi-Fi password
+const char* WIFI_SSID     = "vivoy200";
+const char* WIFI_PASSWORD = "77777777";
 const char* MDNS_HOST     = "omnitouch";          // Accessible as omnitouch.local
 const uint16_t WS_PORT    = 8765;
 

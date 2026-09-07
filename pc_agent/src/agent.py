@@ -43,6 +43,10 @@ class OmniTouchPCAgent:
             on_command_callback=self._handle_voice_command
         )
 
+        # Event deduplication across Wi-Fi & USB Serial
+        self._last_event_time = 0.0
+        self._last_pattern = ""
+
         # Start USB Serial background listener
         self._serial_thread = threading.Thread(target=self._serial_listener_thread, daemon=True)
         self._serial_thread.start()
@@ -95,6 +99,13 @@ class OmniTouchPCAgent:
         self.dispatcher.execute_action(action_name)
 
     def handle_tap_event(self, pattern: str, energy: float):
+        now = time.time()
+        # Suppress duplicate events arriving over both Serial and Wi-Fi within 350ms
+        if pattern == self._last_pattern and (now - self._last_event_time) < 0.35:
+            return
+        self._last_event_time = now
+        self._last_pattern = pattern
+
         timestamp = time.strftime("%H:%M:%S")
         print(f"\n{BOLD}{GREEN}[{timestamp}] [SURFACE HAPTIC EVENT] {pattern} (Energy: {energy:.1f}){RESET}")
 

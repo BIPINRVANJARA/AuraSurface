@@ -1,7 +1,7 @@
 {
-  "esp32_host": "omnitouch.local",
+  "esp32_host": "10.60.64.63",
   "esp32_port": 8765,
-  "fallback_host": "127.0.0.1",
+  "fallback_host": "omnitouch.local",
   "reconnect_interval_sec": 3,
   "haptic_tap_actions": {
     "SINGLE_TAP": "PLAY_PAUSE",

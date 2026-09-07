@@ -8,8 +8,8 @@
 
 // --- Wi-Fi Configuration ---
 // Replace with your local Wi-Fi SSID and Password
-#define WIFI_SSID           "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID           "vivoy200"
+#define WIFI_PASSWORD       "77777777"
 
 // --- Network & WebSocket Settings ---
 #define MDNS_HOSTNAME       "omnitouch"       // Accessible as omnitouch.local
