@@ -38,11 +38,15 @@ const uint16_t WS_PORT    = 8765;
 #define I2S_SD_PIN    32
 #define STATUS_LED    2
 
-// Acoustic Tap Detection Thresholds (Adjustable via PC Calibrator)
-float tapEnergyThreshold      = 2200.0f; // Minimum peak energy to register a knock
-float tapAttackSlopeThreshold = 1200.0f; // Sharp rise required to differentiate knock from voice
-uint32_t tapDebounceMs        = 75;      // Lockout time to prevent surface ring re-triggering
-uint32_t multiTapWindowMs     = 380;     // Max grouping window for double / triple taps (ms)
+// Acoustic Tap Detection Thresholds (Tuned to reject ambient room noise and voices)
+float tapEnergyThreshold      = 8000.0f; // Minimum peak energy (desk knocks produce > 8000-14000)
+float tapAttackSlopeThreshold = 3800.0f; // Sharp rise required to differentiate knock from speech
+uint32_t tapDebounceMs        = 95;      // Lockout time to prevent surface ring re-triggering
+uint32_t multiTapWindowMs     = 420;     // Max grouping window for double / triple taps (ms)
+
+// Transient impulse tracking
+bool tapArmed = true;                    // Must be quiet before a new tap can trigger
+uint32_t tapOnsetMs = 0;                 // Timestamp when current tap peak began
 
 // =============================================================================
 // Data Types & Globals
@@ -152,11 +156,25 @@ void processAudioSamples(const int16_t* samples, size_t count) {
   prevEnergy = smoothedEnergy;
 
   uint32_t now = millis();
+  float releaseThreshold = tapEnergyThreshold * 0.40f;
 
-  // Detect physical knock impulse
-  if (smoothedEnergy >= tapEnergyThreshold && attackSlope >= tapAttackSlopeThreshold) {
+  // Re-arm only when acoustic level drops back down to quiet baseline
+  if (!tapArmed && smoothedEnergy < releaseThreshold) {
+    tapArmed = true;
+  }
+
+  // Reject sustained background sound or human speech (> 90ms duration is NOT a knock)
+  if (inTapWindow && (smoothedEnergy > releaseThreshold) && ((now - tapOnsetMs) > 90)) {
+    inTapWindow = false;
+    currentTapCount = 0;
+  }
+
+  // Detect genuine physical knock impulse
+  if (tapArmed && (smoothedEnergy >= tapEnergyThreshold) && (attackSlope >= tapAttackSlopeThreshold)) {
     if ((now - lastTapTime) >= tapDebounceMs) {
       lastTapTime = now;
+      tapOnsetMs = now;
+      tapArmed = false; // Disarm until energy decays below releaseThreshold!
       lastPeakEnergy = smoothedEnergy;
 
       if (!inTapWindow) {
@@ -283,6 +301,22 @@ void setup() {
 
 void loop() {
   wsServer.loop();
+
+  // Read commands sent over USB Serial (e.g. from PC Agent or Calibrator)
+  if (Serial.available()) {
+    String s = Serial.readStringUntil('\n');
+    s.trim();
+    if (s.indexOf("SET_THRESHOLD") >= 0) {
+      int idx = s.indexOf("\"threshold\":");
+      if (idx > 0) {
+        float t = s.substring(idx + 12).toFloat();
+        if (t > 500 && t < 40000) {
+          tapEnergyThreshold = t;
+          Serial.printf("[Config] Threshold updated via Serial to %.1f\n", t);
+        }
+      }
+    }
+  }
 
   // Multi-tap window expiration check
   uint32_t now = millis();

@@ -30,10 +30,10 @@
 
 // --- Acoustic Surface / Tap Detection Parameters ---
 // Adjust TAP_ENERGY_THRESHOLD using the PC Calibrator tool
-#define TAP_ENERGY_THRESHOLD        2200      // Minimum peak energy to trigger tap
-#define TAP_ATTACK_SLOPE_THRESHOLD  1200      // Sharp rise required for physical tap (rejects voice)
-#define TAP_DEBOUNCE_MS             75        // Lockout time to prevent surface ring re-triggering
-#define MULTI_TAP_WINDOW_MS         380       // Max window to group double/triple taps (ms)
+#define TAP_ENERGY_THRESHOLD        8000      // Minimum peak energy to trigger tap (desk taps reach > 8000-14000)
+#define TAP_ATTACK_SLOPE_THRESHOLD  3800      // Sharp rise required for physical tap (rejects voice)
+#define TAP_DEBOUNCE_MS             95        // Lockout time to prevent surface ring re-triggering
+#define MULTI_TAP_WINDOW_MS         420       // Max window to group double/triple taps (ms)
 
 // --- Voice Command & Telemetry Parameters ---
 #define VOICE_ENERGY_THRESHOLD      1500      // Energy threshold indicating ongoing speech
