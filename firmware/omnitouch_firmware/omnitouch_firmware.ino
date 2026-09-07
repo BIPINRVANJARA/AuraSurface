@@ -312,6 +312,7 @@ void loop() {
     snprintf(jsonBuf, sizeof(jsonBuf),
              "{\"type\":\"EVENT\",\"source\":\"SURFACE\",\"pattern\":\"%s\",\"energy\":%.1f}",
              patStr, evt.energy);
+    Serial.println(jsonBuf);
     wsServer.broadcastTXT(jsonBuf);
   }
 

@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+import threading
 from pathlib import Path
 import websockets
 
@@ -42,6 +43,52 @@ class OmniTouchPCAgent:
             on_command_callback=self._handle_voice_command
         )
 
+        # Start USB Serial background listener
+        self._serial_thread = threading.Thread(target=self._serial_listener_thread, daemon=True)
+        self._serial_thread.start()
+
+    def _serial_listener_thread(self):
+        """Background thread auto-connecting to ESP32 over USB Serial if available."""
+        try:
+            import serial
+            import serial.tools.list_ports
+        except ImportError:
+            return
+
+        while True:
+            port = self.config.get("serial_port")
+            if not port:
+                ports = list(serial.tools.list_ports.comports())
+                for p in ports:
+                    if "CP210" in p.description or "CH340" in p.description or "USB" in p.description:
+                        port = p.device
+                        break
+
+            if port:
+                try:
+                    with serial.Serial(port, 115200, timeout=1, dsrdtr=False, rtscts=False) as ser:
+                        ser.dtr = False
+                        ser.rts = False
+                        print(f"{BOLD}{GREEN}[USB Serial] Connected to OmniTouch ESP32 on {port}!{RESET}")
+                        while True:
+                            line = ser.readline().decode("utf-8", errors="ignore").strip()
+                            if not line:
+                                continue
+                            if '{"type":"EVENT"' in line:
+                                try:
+                                    start = line.find("{")
+                                    end = line.rfind("}") + 1
+                                    msg = json.loads(line[start:end])
+                                    if msg.get("type") == "EVENT":
+                                        pattern = msg.get("pattern", "UNKNOWN")
+                                        energy = float(msg.get("energy", 0.0))
+                                        self.handle_tap_event(pattern, energy)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+            time.sleep(3)
+
     def _handle_voice_command(self, action_name: str):
         timestamp = time.strftime("%H:%M:%S")
         print(f"\n{BOLD}{CYAN}[{timestamp}] [VOICE RECOGNIZED] Executing -> {action_name}{RESET}")
@@ -53,10 +100,10 @@ class OmniTouchPCAgent:
 
         action = self.tap_actions.get(pattern)
         if action:
-            print(f"  └──> Triggering Action: {BOLD}{YELLOW}{action}{RESET}")
+            print(f"  --> Triggering Action: {BOLD}{YELLOW}{action}{RESET}")
             self.dispatcher.execute_action(action)
         else:
-            print(f"  └──> No action mapped for {pattern}")
+            print(f"  --> No action mapped for {pattern}")
 
     async def connect_and_listen(self):
         hosts_to_try = [self.esp32_host, self.fallback_host]
@@ -95,12 +142,12 @@ class OmniTouchPCAgent:
 
     def run(self):
         print(f"{BOLD}{CYAN}======================================================{RESET}")
-        print(f"{BOLD}{CYAN}        OmniTouch AI — Windows PC Agent v1.0         {RESET}")
+        print(f"{BOLD}{CYAN}        OmniTouch AI - Windows PC Agent v1.0         {RESET}")
         print(f"{BOLD}{CYAN}   Haptic Surface Taps + Voice Commands Controller    {RESET}")
         print(f"{BOLD}{CYAN}======================================================{RESET}")
-        print(f"Active Mappings:")
+        print("Active Mappings:")
         for pattern, act in self.tap_actions.items():
-            print(f"  • {pattern:12s} ➔ {act}")
+            print(f"  * {pattern:12s} -> {act}")
         print("------------------------------------------------------\n")
 
         # Start voice command listener if enabled

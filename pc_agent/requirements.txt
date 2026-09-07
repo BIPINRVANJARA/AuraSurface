@@ -6,3 +6,4 @@ comtypes>=1.4.1
 SpeechRecognition>=3.10.1
 pyaudio>=0.2.14; platform_system == "Windows"
 colorama>=0.4.6
+pyserial>=3.5

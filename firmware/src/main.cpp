@@ -135,6 +135,12 @@ void loop() {
         const char* patternStr = tapPatternToString(event.pattern);
         Serial.printf("\n>>> [TAP EVENT] Pattern: %s | Peak Energy: %.1f <<<\n", patternStr, event.energy);
 
+        char jsonBuf[128];
+        snprintf(jsonBuf, sizeof(jsonBuf),
+                 "{\"type\":\"EVENT\",\"source\":\"SURFACE\",\"event\":\"TAP\",\"pattern\":\"%s\",\"energy\":%.1f}",
+                 patternStr, event.energy);
+        Serial.println(jsonBuf);
+
         // Flash onboard LED as physical feedback
         pulseLED();
 
