@@ -38,15 +38,15 @@ const uint16_t WS_PORT    = 8765;
 #define I2S_SD_PIN    32
 #define STATUS_LED    2
 
-// Acoustic Tap Detection Thresholds (Tuned to reject ambient room noise and voices)
-float tapEnergyThreshold      = 8000.0f; // Minimum peak energy (desk knocks produce > 8000-14000)
-float tapAttackSlopeThreshold = 3800.0f; // Sharp rise required to differentiate knock from speech
-uint32_t tapDebounceMs        = 95;      // Lockout time to prevent surface ring re-triggering
-uint32_t multiTapWindowMs     = 420;     // Max grouping window for double / triple taps (ms)
+// Acoustic Tap Detection Thresholds (Adaptive Noise Floor)
+float knockDeltaThreshold     = 3500.0f; // Height above ambient room noise required for a physical knock
+float tapAttackSlopeThreshold = 2200.0f; // Sharp rise required to differentiate knock from speech
+uint32_t tapDebounceMs        = 120;     // Lockout time to prevent desk vibration ring re-triggering
+uint32_t multiTapWindowMs     = 450;     // Max grouping window for double / triple taps (ms)
 
-// Transient impulse tracking
-bool tapArmed = true;                    // Must be quiet before a new tap can trigger
-uint32_t tapOnsetMs = 0;                 // Timestamp when current tap peak began
+// Adaptive Ambient Noise Tracking
+float ambientNoiseFloor       = 4500.0f; // Automatically tracks room background noise
+bool tapArmed                 = true;    // Re-arms when quiet or after debounce window
 
 // =============================================================================
 // Data Types & Globals
@@ -145,36 +145,42 @@ void processAudioSamples(const int16_t* samples, size_t count) {
 
   float batchAvg = batchSum / count;
 
-  // Envelope follower
+  // Fast-attack envelope follower
   if (batchPeak > smoothedEnergy) {
-    smoothedEnergy = (smoothedEnergy * 0.3f) + (batchPeak * 0.7f);
+    smoothedEnergy = (smoothedEnergy * 0.25f) + (batchPeak * 0.75f);
   } else {
     smoothedEnergy = (smoothedEnergy * 0.85f) + (batchAvg * 0.15f);
+  }
+
+  // Asymmetric baseline tracker: tracks quiet floor of smoothedEnergy
+  if (smoothedEnergy < ambientNoiseFloor) {
+    ambientNoiseFloor = (ambientNoiseFloor * 0.88f) + (smoothedEnergy * 0.12f); // Fast catch-down to quiet floor
+  } else {
+    ambientNoiseFloor = (ambientNoiseFloor * 0.996f) + (smoothedEnergy * 0.004f); // Very slow drift upward
   }
 
   float attackSlope = smoothedEnergy - prevEnergy;
   prevEnergy = smoothedEnergy;
 
+  // Impulse height above current ambient room noise floor
+  float knockDelta = smoothedEnergy - ambientNoiseFloor;
+  if (knockDelta < 0.0f) knockDelta = 0.0f;
+
   uint32_t now = millis();
-  float releaseThreshold = tapEnergyThreshold * 0.40f;
 
-  // Re-arm only when acoustic level drops back down to quiet baseline
-  if (!tapArmed && smoothedEnergy < releaseThreshold) {
-    tapArmed = true;
+  // Re-arm when vibration subsides OR when debounce time passes (guaranteed never stuck)
+  if (!tapArmed) {
+    if ((knockDelta < (knockDeltaThreshold * 0.40f)) || ((now - lastTapTime) >= tapDebounceMs)) {
+      tapArmed = true;
+    }
   }
 
-  // Reject sustained background sound or human speech (> 90ms duration is NOT a knock)
-  if (inTapWindow && (smoothedEnergy > releaseThreshold) && ((now - tapOnsetMs) > 90)) {
-    inTapWindow = false;
-    currentTapCount = 0;
-  }
-
-  // Detect genuine physical knock impulse
-  if (tapArmed && (smoothedEnergy >= tapEnergyThreshold) && (attackSlope >= tapAttackSlopeThreshold)) {
+  // Detect genuine physical knock impulse:
+  // Must jump significantly above ambient background AND have a steep attack slope
+  if (tapArmed && (knockDelta >= knockDeltaThreshold) && (attackSlope >= tapAttackSlopeThreshold)) {
     if ((now - lastTapTime) >= tapDebounceMs) {
       lastTapTime = now;
-      tapOnsetMs = now;
-      tapArmed = false; // Disarm until energy decays below releaseThreshold!
+      tapArmed = false; // Disarm until signal decays or debounce window expires
       lastPeakEnergy = smoothedEnergy;
 
       if (!inTapWindow) {
@@ -232,8 +238,8 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
         if (idx > 0) {
           float t = msg.substring(idx + 12).toFloat();
           if (t > 100 && t < 30000) {
-            tapEnergyThreshold = t;
-            Serial.printf("[Config] Threshold updated to %.1f\n", t);
+            knockDeltaThreshold = t;
+            Serial.printf("[Config] Knock Delta Threshold updated to %.1f\n", t);
           }
         }
       }
@@ -310,9 +316,9 @@ void loop() {
       int idx = s.indexOf("\"threshold\":");
       if (idx > 0) {
         float t = s.substring(idx + 12).toFloat();
-        if (t > 500 && t < 40000) {
-          tapEnergyThreshold = t;
-          Serial.printf("[Config] Threshold updated via Serial to %.1f\n", t);
+        if (t > 100 && t < 40000) {
+          knockDeltaThreshold = t;
+          Serial.printf("[Config] Knock Delta Threshold updated via Serial to %.1f\n", t);
         }
       }
     }
@@ -353,10 +359,11 @@ void loop() {
   // Telemetry stream (every 50ms) for real-time visual calibration
   if (now - lastTelemetryTime >= 50) {
     lastTelemetryTime = now;
-    char telemBuf[128];
+    float delta = smoothedEnergy - ambientNoiseFloor;
+    char telemBuf[140];
     snprintf(telemBuf, sizeof(telemBuf),
-             "{\"type\":\"TELEMETRY\",\"energy\":%.1f,\"peak\":%.1f,\"threshold\":%.1f}",
-             smoothedEnergy, lastPeakEnergy, tapEnergyThreshold);
+             "{\"type\":\"TELEMETRY\",\"energy\":%.1f,\"floor\":%.1f,\"delta\":%.1f,\"threshold\":%.1f}",
+             smoothedEnergy, ambientNoiseFloor, delta, knockDeltaThreshold);
     wsServer.broadcastTXT(telemBuf);
   }
 

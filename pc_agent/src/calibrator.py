@@ -58,16 +58,17 @@ async def run_calibrator(uri: str):
 
                         if msg_type == "TELEMETRY":
                             energy = float(data.get("energy", 0.0))
-                            peak = float(data.get("peak", 0.0))
+                            floor = float(data.get("floor", 4000.0))
+                            delta = float(data.get("delta", max(0.0, energy - floor)))
                             threshold = float(data.get("threshold", current_threshold))
                             current_threshold = threshold
 
-                            bar_str = render_meter(energy, threshold)
-                            status_color = YELLOW if energy >= threshold else CYAN
+                            bar_str = render_meter(delta, threshold, max_scale=5000.0)
+                            status_color = YELLOW if delta >= threshold else CYAN
                             sys.stdout.write(
-                                f"\rLevel: [{bar_str}]  "
-                                f"Energy: {status_color}{int(energy):4d}{RESET} | "
-                                f"Peak: {int(peak):4d} | "
+                                f"\rKnock Delta: [{bar_str}]  "
+                                f"Delta: {status_color}{int(delta):4d}{RESET} | "
+                                f"Floor: {int(floor):4d} | "
                                 f"Thresh: {int(threshold):4d}  "
                             )
                             sys.stdout.flush()
@@ -76,7 +77,7 @@ async def run_calibrator(uri: str):
                             pattern = data.get("pattern", "UNKNOWN")
                             p_energy = data.get("energy", 0)
                             sys.stdout.write("\n")
-                            print(f"{BOLD}{GREEN}>>> [EVENT DETECTED] {pattern} | Peak: {p_energy} <<<{RESET}")
+                            print(f"{BOLD}{GREEN}>>> [EVENT DETECTED] {pattern} | Energy: {p_energy} <<<{RESET}")
                             sys.stdout.flush()
 
                     except json.JSONDecodeError:
@@ -88,7 +89,7 @@ async def run_calibrator(uri: str):
 
 
 def main():
-    uri = "ws://127.0.0.1:8765"
+    uri = "ws://10.60.64.63:8765"
     if len(sys.argv) > 1:
         uri = sys.argv[1]
     elif os.environ.get("OMNITOUCH_WS"):
