@@ -15,10 +15,10 @@ RESET = "\033[0m"
 # Enable Windows virtual terminal sequences
 os.system("")
 
-def render_meter(energy: float, threshold: float, max_scale: float = 6000.0, width: int = 40) -> str:
+def render_meter(energy: float, threshold: float, max_scale: float = 35000.0, width: int = 40) -> str:
     """Render a visual ASCII energy bar with threshold marker."""
-    norm_energy = min(energy / max_scale, 1.0)
-    norm_thresh = min(threshold / max_scale, 1.0)
+    norm_energy = min(max(0.0, energy) / max_scale, 1.0)
+    norm_thresh = min(max(0.0, threshold) / max_scale, 1.0)
 
     energy_pos = int(norm_energy * width)
     thresh_pos = int(norm_thresh * width)
@@ -41,10 +41,10 @@ async def run_calibrator(uri: str):
     print(f"{BOLD}{CYAN}   OmniTouch AI — Real-Time Acoustic Tap Calibrator   {RESET}")
     print(f"{BOLD}{CYAN}======================================================{RESET}")
     print(f"Connecting to: {uri} ...")
-    print(f"Tip: Knock or tap on your desk to see acoustic vibration peaks.")
-    print(f"Red marker '|' represents the trigger threshold.\n")
+    print(f"Tip: System auto-profiles classroom background noise on boot.")
+    print(f"Red marker '|' represents the dynamic knock trigger threshold.\n")
 
-    current_threshold = 2200.0
+    current_threshold = 14500.0
 
     while True:
         try:
@@ -57,27 +57,42 @@ async def run_calibrator(uri: str):
                         msg_type = data.get("type")
 
                         if msg_type == "TELEMETRY":
+                            state = data.get("state", "RUNNING")
                             energy = float(data.get("energy", 0.0))
-                            floor = float(data.get("floor", 4000.0))
+                            floor = float(data.get("floor", 6000.0))
                             delta = float(data.get("delta", max(0.0, energy - floor)))
                             threshold = float(data.get("threshold", current_threshold))
                             current_threshold = threshold
 
-                            bar_str = render_meter(delta, threshold, max_scale=5000.0)
+                            bar_str = render_meter(delta, threshold, max_scale=35000.0)
                             status_color = YELLOW if delta >= threshold else CYAN
+                            state_str = f"{YELLOW}[CALIBRATING]{RESET}" if state == "CALIBRATING" else f"{GREEN}[ONLINE]{RESET}"
                             sys.stdout.write(
-                                f"\rKnock Delta: [{bar_str}]  "
-                                f"Delta: {status_color}{int(delta):4d}{RESET} | "
-                                f"Floor: {int(floor):4d} | "
-                                f"Thresh: {int(threshold):4d}  "
+                                f"\r{state_str} Knock Delta: [{bar_str}] "
+                                f"Delta: {status_color}{int(delta):5d}{RESET} | "
+                                f"Floor: {int(floor):5d} | "
+                                f"Thresh: {int(threshold):5d} "
                             )
+                            sys.stdout.flush()
+
+                        elif msg_type == "CALIBRATION_START":
+                            sys.stdout.write("\n")
+                            print(f"{BOLD}{YELLOW}>>> [AUTO-CALIBRATION STARTED] Profiling room acoustics (3.5s)... <<<{RESET}")
+                            sys.stdout.flush()
+
+                        elif msg_type == "CALIBRATION_COMPLETE":
+                            sys.stdout.write("\n")
+                            floor = data.get("floor", 0)
+                            spike = data.get("maxSpike", 0)
+                            thresh = data.get("threshold", 0)
+                            print(f"{BOLD}{GREEN}>>> [CALIBRATION COMPLETE] Floor: {floor:.0f} | Max Spike: {spike:.0f} | Dynamic Threshold: {thresh:.0f} <<<{RESET}\n")
                             sys.stdout.flush()
 
                         elif msg_type == "EVENT":
                             pattern = data.get("pattern", "UNKNOWN")
                             p_energy = data.get("energy", 0)
                             sys.stdout.write("\n")
-                            print(f"{BOLD}{GREEN}>>> [EVENT DETECTED] {pattern} | Energy: {p_energy} <<<{RESET}")
+                            print(f"{BOLD}{GREEN}>>> [EVENT DETECTED] {pattern} | Energy: {p_energy:.1f} <<<{RESET}")
                             sys.stdout.flush()
 
                     except json.JSONDecodeError:

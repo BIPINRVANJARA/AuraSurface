@@ -38,16 +38,34 @@ const uint16_t WS_PORT    = 8765;
 #define I2S_SD_PIN    32
 #define STATUS_LED    2
 
-// Acoustic Tap Detection Thresholds (Classroom Calibrated)
-float knockDeltaThreshold     = 14500.0f; // Height above ambient room noise (classroom chatter peaks at ~13,800)
-float tapAttackSlopeThreshold = 2500.0f;  // Instantaneous shockwave rise required for knock
+// Acoustic Tap Detection Thresholds
+float knockDeltaThreshold     = 14500.0f; // Base height above ambient room noise
+float tapAttackSlopeThreshold = 2200.0f;  // Instantaneous shockwave rise required for knock
 uint32_t tapDebounceMs        = 190;      // Lockout time to prevent desk vibration ring re-triggering
 uint32_t multiTapWindowMs     = 380;      // Max grouping window for double / triple taps (ms)
 
-// Adaptive Ambient Noise Tracking
-float ambientNoiseFloor       = 6000.0f; // Automatically tracks room background noise
-bool tapArmed                 = true;    // Re-arms when quiet or after debounce window
-bool soundDroppedBetweenTaps  = true;    // Rejects continuous speech/crowd from accumulating taps
+// Adaptive Ambient Noise Tracking & Dynamic Scaling
+float ambientNoiseFloor       = 6000.0f;  // Automatically tracks room background noise
+float baseKnockThreshold      = 12000.0f; // Calibrated floor margin
+float effectiveThreshold      = 14500.0f; // Dynamically adjusted based on real-time room volume
+bool tapArmed                 = true;     // Re-arms when quiet or after debounce window
+bool soundDroppedBetweenTaps  = true;     // Rejects continuous speech/crowd from accumulating taps
+
+// Calibration State Machine
+enum SystemState {
+  STATE_CALIBRATING,
+  STATE_RUNNING
+};
+
+SystemState currentState          = STATE_CALIBRATING;
+uint32_t calibStartTimeMs         = 0;
+const uint32_t CALIB_DURATION_MS  = 3500; // 3.5 seconds room profiling
+float calibEnergySum              = 0.0f;
+uint32_t calibSampleCount         = 0;
+float calibMaxEnergy              = 0.0f;
+float calibMaxDelta               = 0.0f;
+uint32_t lastLedBlinkTime         = 0;
+bool ledState                     = false;
 
 // =============================================================================
 // Data Types & Globals
@@ -153,8 +171,38 @@ void processAudioSamples(const int16_t* samples, size_t count) {
     smoothedEnergy = (smoothedEnergy * 0.85f) + (batchAvg * 0.15f);
   }
 
-  // Rapidly track changing classroom ambient noise floor (~1-2 second response)
-  // Only update floor when not in the middle of a knock impulse, preserving true background baseline
+  // Crest factor: peak-to-average ratio in this 8ms batch (impulsive knocks have high crest > 2.0)
+  float crestFactor = batchAvg > 10.0f ? (batchPeak / batchAvg) : 1.0f;
+
+  // ---------------------------------------------------------------------------
+  // STATE 1: CALIBRATING (Profile ambient noise floor & room chatter surges)
+  // ---------------------------------------------------------------------------
+  if (currentState == STATE_CALIBRATING) {
+    calibEnergySum += smoothedEnergy;
+    calibSampleCount++;
+    if (smoothedEnergy > calibMaxEnergy) calibMaxEnergy = smoothedEnergy;
+
+    if (smoothedEnergy < ambientNoiseFloor) {
+      ambientNoiseFloor = (ambientNoiseFloor * 0.90f) + (smoothedEnergy * 0.10f);
+    } else {
+      ambientNoiseFloor = (ambientNoiseFloor * 0.96f) + (smoothedEnergy * 0.04f);
+    }
+
+    float delta = smoothedEnergy - ambientNoiseFloor;
+    if (delta > calibMaxDelta) calibMaxDelta = delta;
+
+    prevEnergy = smoothedEnergy;
+    return; // Block all tap events while calibrating
+  }
+
+  // ---------------------------------------------------------------------------
+  // STATE 2: RUNNING (Dynamic Sensitivity & Tap Recognition)
+  // ---------------------------------------------------------------------------
+  // Dynamic scaling: increases threshold if the room gets louder, lowers when quiet
+  effectiveThreshold = std::max(baseKnockThreshold, ambientNoiseFloor * 1.25f);
+  knockDeltaThreshold = effectiveThreshold;
+
+  // Track room ambient noise floor when not in tap impulse
   if (tapArmed) {
     if (smoothedEnergy < ambientNoiseFloor) {
       ambientNoiseFloor = (ambientNoiseFloor * 0.90f) + (smoothedEnergy * 0.10f); // Quick catch-down when quiet
@@ -173,7 +221,7 @@ void processAudioSamples(const int16_t* samples, size_t count) {
   uint32_t now = millis();
 
   // Track if sound decayed back towards quiet baseline
-  if (knockDelta < (knockDeltaThreshold * 0.40f)) {
+  if (knockDelta < (effectiveThreshold * 0.40f)) {
     soundDroppedBetweenTaps = true;
     tapArmed = true;
   } else if ((now - lastTapTime) >= tapDebounceMs) {
@@ -181,9 +229,10 @@ void processAudioSamples(const int16_t* samples, size_t count) {
   }
 
   // Detect genuine physical knock impulse:
-  // 1. Must jump significantly above ambient background (knockDelta >= 3800)
-  // 2. Must have steep attack slope (shockwave rise >= 1800)
-  if (tapArmed && (knockDelta >= knockDeltaThreshold) && (attackSlope >= tapAttackSlopeThreshold)) {
+  // 1. Must jump significantly above dynamic ambient background (knockDelta >= effectiveThreshold)
+  // 2. Must have steep attack slope (shockwave rise >= tapAttackSlopeThreshold)
+  // 3. Must have impulsive crest factor (crestFactor >= 1.9f)
+  if (tapArmed && (knockDelta >= effectiveThreshold) && (attackSlope >= tapAttackSlopeThreshold) && (crestFactor >= 1.9f)) {
     if ((now - lastTapTime) >= tapDebounceMs) {
       // CROWD NOISE IMMUNITY:
       // For multi-taps (2nd or 3rd knock), require that sound dropped towards baseline between knocks!
@@ -232,6 +281,22 @@ void audioTask(void* param) {
 }
 
 // =============================================================================
+// Calibration Controller
+// =============================================================================
+void startCalibration() {
+  currentState = STATE_CALIBRATING;
+  calibStartTimeMs = millis();
+  calibEnergySum = 0.0f;
+  calibSampleCount = 0;
+  calibMaxEnergy = 0.0f;
+  calibMaxDelta = 0.0f;
+  inTapWindow = false;
+  currentTapCount = 0;
+  Serial.println("\n[Calibration] Profiling background acoustic noise (3.5s)...");
+  wsServer.broadcastTXT("{\"type\":\"CALIBRATION_START\",\"duration\":3500}");
+}
+
+// =============================================================================
 // WebSocket Event Handler
 // =============================================================================
 void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
@@ -247,13 +312,17 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
       break;
     case WStype_TEXT: {
       String msg = String((char*)payload).substring(0, length);
-      if (msg.indexOf("SET_THRESHOLD") >= 0) {
+      if (msg.indexOf("CALIBRATE") >= 0) {
+        startCalibration();
+      } else if (msg.indexOf("SET_THRESHOLD") >= 0) {
         int idx = msg.indexOf("\"threshold\":");
         if (idx > 0) {
           float t = msg.substring(idx + 12).toFloat();
-          if (t > 100 && t < 30000) {
+          if (t > 100 && t < 40000) {
+            baseKnockThreshold = t;
             knockDeltaThreshold = t;
-            Serial.printf("[Config] Knock Delta Threshold updated to %.1f\n", t);
+            effectiveThreshold = t;
+            Serial.printf("[Config] Knock Threshold manually updated to %.1f\n", t);
           }
         }
       }
@@ -316,30 +385,74 @@ void setup() {
   xTaskCreatePinnedToCore(audioTask, "audioTask", 4096, NULL, 2, NULL, 0);
 
   pulseLed();
-  Serial.println("[Ready] Knock or tap on surface to test.");
+  Serial.println("[Ready] Starting initial auto-calibration...");
+  startCalibration();
 }
 
 void loop() {
   wsServer.loop();
 
+  uint32_t now = millis();
+
+  // Calibration completion check & fast status LED blinking
+  if (currentState == STATE_CALIBRATING) {
+    if (now - lastLedBlinkTime >= 90) {
+      lastLedBlinkTime = now;
+      ledState = !ledState;
+      digitalWrite(STATUS_LED, ledState ? HIGH : LOW);
+    }
+
+    if ((now - calibStartTimeMs) >= CALIB_DURATION_MS) {
+      currentState = STATE_RUNNING;
+      float avgFloor = calibSampleCount > 0 ? (calibEnergySum / calibSampleCount) : ambientNoiseFloor;
+      ambientNoiseFloor = avgFloor;
+
+      // Base knock threshold: comfortable margin above the highest room surge observed
+      baseKnockThreshold = std::max(6000.0f, (calibMaxDelta * 1.30f) + 2500.0f);
+      effectiveThreshold = std::max(baseKnockThreshold, ambientNoiseFloor * 1.25f);
+      knockDeltaThreshold = effectiveThreshold;
+
+      // Double confirmation flash
+      digitalWrite(STATUS_LED, HIGH); delay(100); digitalWrite(STATUS_LED, LOW); delay(60);
+      digitalWrite(STATUS_LED, HIGH); delay(100); digitalWrite(STATUS_LED, LOW);
+
+      Serial.println("\n======================================================");
+      Serial.println("  [OmniTouch Calibration Complete] System Online!     ");
+      Serial.printf("  * Measured Ambient Floor: %.1f\n", ambientNoiseFloor);
+      Serial.printf("  * Max Background Spike:   %.1f\n", calibMaxDelta);
+      Serial.printf("  * Calibrated Threshold:   %.1f\n", effectiveThreshold);
+      Serial.println("======================================================\n");
+
+      char calibMsg[180];
+      snprintf(calibMsg, sizeof(calibMsg),
+               "{\"type\":\"CALIBRATION_COMPLETE\",\"floor\":%.1f,\"maxSpike\":%.1f,\"threshold\":%.1f}",
+               ambientNoiseFloor, calibMaxDelta, effectiveThreshold);
+      Serial.println(calibMsg);
+      wsServer.broadcastTXT(calibMsg);
+    }
+  }
+
   // Read commands sent over USB Serial (e.g. from PC Agent or Calibrator)
   if (Serial.available()) {
     String s = Serial.readStringUntil('\n');
     s.trim();
-    if (s.indexOf("SET_THRESHOLD") >= 0) {
+    if (s.indexOf("CALIBRATE") >= 0) {
+      startCalibration();
+    } else if (s.indexOf("SET_THRESHOLD") >= 0) {
       int idx = s.indexOf("\"threshold\":");
       if (idx > 0) {
         float t = s.substring(idx + 12).toFloat();
         if (t > 100 && t < 40000) {
+          baseKnockThreshold = t;
           knockDeltaThreshold = t;
-          Serial.printf("[Config] Knock Delta Threshold updated via Serial to %.1f\n", t);
+          effectiveThreshold = t;
+          Serial.printf("[Config] Knock Threshold manually updated via Serial to %.1f\n", t);
         }
       }
     }
   }
 
   // Multi-tap window expiration check: emit when user finishes tapping or reaches triple tap
-  uint32_t now = millis();
   if (inTapWindow) {
     if (currentTapCount >= 3 || ((now - lastTapTime) >= multiTapWindowMs)) {
       TapPattern pattern = TAP_NONE;
@@ -376,10 +489,11 @@ void loop() {
   if (now - lastTelemetryTime >= 50) {
     lastTelemetryTime = now;
     float delta = smoothedEnergy - ambientNoiseFloor;
-    char telemBuf[140];
+    char telemBuf[160];
     snprintf(telemBuf, sizeof(telemBuf),
-             "{\"type\":\"TELEMETRY\",\"energy\":%.1f,\"floor\":%.1f,\"delta\":%.1f,\"threshold\":%.1f}",
-             smoothedEnergy, ambientNoiseFloor, delta, knockDeltaThreshold);
+             "{\"type\":\"TELEMETRY\",\"state\":\"%s\",\"energy\":%.1f,\"floor\":%.1f,\"delta\":%.1f,\"threshold\":%.1f}",
+             currentState == STATE_CALIBRATING ? "CALIBRATING" : "RUNNING",
+             smoothedEnergy, ambientNoiseFloor, delta, effectiveThreshold);
     wsServer.broadcastTXT(telemBuf);
   }
 

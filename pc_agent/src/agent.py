@@ -140,6 +140,15 @@ class OmniTouchPCAgent:
                                 energy = float(msg.get("energy", 0.0))
                                 self.handle_tap_event(pattern, energy)
 
+                            elif msg_type == "CALIBRATION_START":
+                                print(f"{YELLOW}[Auto-Calibration] Profiling ambient acoustics for 3.5s...{RESET}")
+
+                            elif msg_type == "CALIBRATION_COMPLETE":
+                                floor = msg.get("floor", 0)
+                                spike = msg.get("maxSpike", 0)
+                                thresh = msg.get("threshold", 0)
+                                print(f"{BOLD}{GREEN}[Calibration Complete] Baseline Floor: {floor:.0f} | Room Spikes: {spike:.0f} | Dynamic Threshold: {thresh:.0f}{RESET}")
+
                             elif msg_type == "INFO":
                                 print(f"{CYAN}[Device Info] {msg.get('device')} v{msg.get('version')}{RESET}")
 
