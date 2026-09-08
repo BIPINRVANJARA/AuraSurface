@@ -38,18 +38,16 @@ const uint16_t WS_PORT    = 8765;
 #define I2S_SD_PIN    32
 #define STATUS_LED    2
 
-// Acoustic Tap Detection Thresholds (Classroom Crowd Noise Immunity)
-float knockDeltaThreshold     = 7500.0f; // Height above ambient room noise required for a physical knock
-float tapAttackSlopeThreshold = 2800.0f; // Sharp rise required to differentiate knock from speech
-uint32_t tapDebounceMs        = 110;     // Lockout time to prevent desk vibration ring re-triggering
-uint32_t multiTapWindowMs     = 450;     // Max grouping window for double / triple taps (ms)
-const uint32_t MAX_KNOCK_DURATION_MS = 45; // Any sound persisting > 45ms is airborne crowd noise!
+// Acoustic Tap Detection Thresholds (Classroom Calibrated)
+float knockDeltaThreshold     = 14500.0f; // Height above ambient room noise (classroom chatter peaks at ~13,800)
+float tapAttackSlopeThreshold = 2500.0f;  // Instantaneous shockwave rise required for knock
+uint32_t tapDebounceMs        = 190;      // Lockout time to prevent desk vibration ring re-triggering
+uint32_t multiTapWindowMs     = 380;      // Max grouping window for double / triple taps (ms)
 
 // Adaptive Ambient Noise Tracking
-float ambientNoiseFloor       = 8000.0f; // Automatically tracks room background noise
+float ambientNoiseFloor       = 6000.0f; // Automatically tracks room background noise
 bool tapArmed                 = true;    // Re-arms when quiet or after debounce window
-uint32_t tapOnsetMs           = 0;       // Onset time of candidate impulse
-bool candidateImpulseActive   = false;   // Active while verifying impulse duration
+bool soundDroppedBetweenTaps  = true;    // Rejects continuous speech/crowd from accumulating taps
 
 // =============================================================================
 // Data Types & Globals
@@ -156,17 +154,17 @@ void processAudioSamples(const int16_t* samples, size_t count) {
   }
 
   // Rapidly track changing classroom ambient noise floor (~1-2 second response)
-  if (smoothedEnergy < ambientNoiseFloor) {
-    ambientNoiseFloor = (ambientNoiseFloor * 0.90f) + (smoothedEnergy * 0.10f); // Quick catch-down when quiet
-  } else {
-    ambientNoiseFloor = (ambientNoiseFloor * 0.980f) + (smoothedEnergy * 0.020f); // Fast tracking of crowd volume
+  // Only update floor when not in the middle of a knock impulse, preserving true background baseline
+  if (tapArmed) {
+    if (smoothedEnergy < ambientNoiseFloor) {
+      ambientNoiseFloor = (ambientNoiseFloor * 0.90f) + (smoothedEnergy * 0.10f); // Quick catch-down when quiet
+    } else {
+      ambientNoiseFloor = (ambientNoiseFloor * 0.980f) + (smoothedEnergy * 0.020f); // Fast tracking of crowd volume
+    }
   }
 
   float attackSlope = smoothedEnergy - prevEnergy;
   prevEnergy = smoothedEnergy;
-
-  // Crest factor: peak-to-average ratio in this 8ms batch (impulsive knocks have high crest > 2.6)
-  float crestFactor = batchAvg > 10.0f ? (batchPeak / batchAvg) : 1.0f;
 
   // Impulse height above current ambient room noise floor
   float knockDelta = smoothedEnergy - ambientNoiseFloor;
@@ -174,38 +172,29 @@ void processAudioSamples(const int16_t* samples, size_t count) {
 
   uint32_t now = millis();
 
-  // 1. CROWD NOISE / SPEECH DURATION REJECTION:
-  // True mechanical desk knocks decay in < 35-45ms.
-  // Classroom crowd noise, laughing, and shouting persist > 100-1000ms.
-  if (candidateImpulseActive) {
-    if ((now - tapOnsetMs) > MAX_KNOCK_DURATION_MS) {
-      // Sound lingered too long! This is airborne speech or classroom crowd chatter -> Cancel!
-      candidateImpulseActive = false;
-      inTapWindow = false;
-      currentTapCount = 0;
-    } else if (knockDelta < (knockDeltaThreshold * 0.35f)) {
-      // Sound decayed sharply within 45ms! Confirmed real physical impulse.
-      candidateImpulseActive = false;
-    }
-  }
-
-  // Re-arm when acoustic level decays back to quiet baseline
-  if (!tapArmed) {
-    if ((knockDelta < (knockDeltaThreshold * 0.35f)) || ((now - lastTapTime) >= tapDebounceMs)) {
-      tapArmed = true;
-    }
+  // Track if sound decayed back towards quiet baseline
+  if (knockDelta < (knockDeltaThreshold * 0.40f)) {
+    soundDroppedBetweenTaps = true;
+    tapArmed = true;
+  } else if ((now - lastTapTime) >= tapDebounceMs) {
+    tapArmed = true;
   }
 
   // Detect genuine physical knock impulse:
-  // 1. Must spike >= knockDeltaThreshold above current classroom background
-  // 2. Must have steep attack slope (instantaneous shockwave rise)
-  // 3. Must have high crest factor (sharp impulse vs diffuse crowd noise)
-  if (tapArmed && (knockDelta >= knockDeltaThreshold) && (attackSlope >= tapAttackSlopeThreshold) && (crestFactor >= 2.5f)) {
+  // 1. Must jump significantly above ambient background (knockDelta >= 3800)
+  // 2. Must have steep attack slope (shockwave rise >= 1800)
+  if (tapArmed && (knockDelta >= knockDeltaThreshold) && (attackSlope >= tapAttackSlopeThreshold)) {
     if ((now - lastTapTime) >= tapDebounceMs) {
+      // CROWD NOISE IMMUNITY:
+      // For multi-taps (2nd or 3rd knock), require that sound dropped towards baseline between knocks!
+      // Continuous speech, cheering, or crowd noise never drops, so it can NEVER accumulate multiple taps!
+      if (inTapWindow && !soundDroppedBetweenTaps) {
+        return; // Ignore continuous crowd noise
+      }
+
       lastTapTime = now;
-      tapOnsetMs = now;
-      candidateImpulseActive = true;
-      tapArmed = false; // Disarm until vibration dies down
+      tapArmed = false;
+      soundDroppedBetweenTaps = false; // Must drop before next tap is accepted
       lastPeakEnergy = smoothedEnergy;
 
       if (!inTapWindow) {
@@ -349,21 +338,23 @@ void loop() {
     }
   }
 
-  // Multi-tap window expiration check
+  // Multi-tap window expiration check: emit when user finishes tapping or reaches triple tap
   uint32_t now = millis();
-  if (inTapWindow && ((now - windowStartTime) >= multiTapWindowMs)) {
-    inTapWindow = false;
+  if (inTapWindow) {
+    if (currentTapCount >= 3 || ((now - lastTapTime) >= multiTapWindowMs)) {
+      TapPattern pattern = TAP_NONE;
+      if (currentTapCount == 1) pattern = TAP_SINGLE;
+      else if (currentTapCount == 2) pattern = TAP_DOUBLE;
+      else if (currentTapCount >= 3) pattern = TAP_TRIPLE;
 
-    TapPattern pattern = TAP_NONE;
-    if (currentTapCount == 1) pattern = TAP_SINGLE;
-    else if (currentTapCount == 2) pattern = TAP_DOUBLE;
-    else if (currentTapCount >= 3) pattern = TAP_TRIPLE;
+      inTapWindow = false;
+      currentTapCount = 0;
 
-    if (pattern != TAP_NONE) {
-      TapEventMessage msg = { pattern, lastPeakEnergy };
-      xQueueSend(tapEventQueue, &msg, 0);
+      if (pattern != TAP_NONE) {
+        TapEventMessage msg = { pattern, lastPeakEnergy };
+        xQueueSend(tapEventQueue, &msg, 0);
+      }
     }
-    currentTapCount = 0;
   }
 
   // Process and broadcast detected tap events
