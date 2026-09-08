@@ -38,15 +38,18 @@ const uint16_t WS_PORT    = 8765;
 #define I2S_SD_PIN    32
 #define STATUS_LED    2
 
-// Acoustic Tap Detection Thresholds (Adaptive Noise Floor)
-float knockDeltaThreshold     = 3500.0f; // Height above ambient room noise required for a physical knock
-float tapAttackSlopeThreshold = 2200.0f; // Sharp rise required to differentiate knock from speech
-uint32_t tapDebounceMs        = 120;     // Lockout time to prevent desk vibration ring re-triggering
+// Acoustic Tap Detection Thresholds (Classroom Crowd Noise Immunity)
+float knockDeltaThreshold     = 7500.0f; // Height above ambient room noise required for a physical knock
+float tapAttackSlopeThreshold = 2800.0f; // Sharp rise required to differentiate knock from speech
+uint32_t tapDebounceMs        = 110;     // Lockout time to prevent desk vibration ring re-triggering
 uint32_t multiTapWindowMs     = 450;     // Max grouping window for double / triple taps (ms)
+const uint32_t MAX_KNOCK_DURATION_MS = 45; // Any sound persisting > 45ms is airborne crowd noise!
 
 // Adaptive Ambient Noise Tracking
-float ambientNoiseFloor       = 4500.0f; // Automatically tracks room background noise
+float ambientNoiseFloor       = 8000.0f; // Automatically tracks room background noise
 bool tapArmed                 = true;    // Re-arms when quiet or after debounce window
+uint32_t tapOnsetMs           = 0;       // Onset time of candidate impulse
+bool candidateImpulseActive   = false;   // Active while verifying impulse duration
 
 // =============================================================================
 // Data Types & Globals
@@ -152,15 +155,18 @@ void processAudioSamples(const int16_t* samples, size_t count) {
     smoothedEnergy = (smoothedEnergy * 0.85f) + (batchAvg * 0.15f);
   }
 
-  // Asymmetric baseline tracker: tracks quiet floor of smoothedEnergy
+  // Rapidly track changing classroom ambient noise floor (~1-2 second response)
   if (smoothedEnergy < ambientNoiseFloor) {
-    ambientNoiseFloor = (ambientNoiseFloor * 0.88f) + (smoothedEnergy * 0.12f); // Fast catch-down to quiet floor
+    ambientNoiseFloor = (ambientNoiseFloor * 0.90f) + (smoothedEnergy * 0.10f); // Quick catch-down when quiet
   } else {
-    ambientNoiseFloor = (ambientNoiseFloor * 0.996f) + (smoothedEnergy * 0.004f); // Very slow drift upward
+    ambientNoiseFloor = (ambientNoiseFloor * 0.980f) + (smoothedEnergy * 0.020f); // Fast tracking of crowd volume
   }
 
   float attackSlope = smoothedEnergy - prevEnergy;
   prevEnergy = smoothedEnergy;
+
+  // Crest factor: peak-to-average ratio in this 8ms batch (impulsive knocks have high crest > 2.6)
+  float crestFactor = batchAvg > 10.0f ? (batchPeak / batchAvg) : 1.0f;
 
   // Impulse height above current ambient room noise floor
   float knockDelta = smoothedEnergy - ambientNoiseFloor;
@@ -168,19 +174,38 @@ void processAudioSamples(const int16_t* samples, size_t count) {
 
   uint32_t now = millis();
 
-  // Re-arm when vibration subsides OR when debounce time passes (guaranteed never stuck)
+  // 1. CROWD NOISE / SPEECH DURATION REJECTION:
+  // True mechanical desk knocks decay in < 35-45ms.
+  // Classroom crowd noise, laughing, and shouting persist > 100-1000ms.
+  if (candidateImpulseActive) {
+    if ((now - tapOnsetMs) > MAX_KNOCK_DURATION_MS) {
+      // Sound lingered too long! This is airborne speech or classroom crowd chatter -> Cancel!
+      candidateImpulseActive = false;
+      inTapWindow = false;
+      currentTapCount = 0;
+    } else if (knockDelta < (knockDeltaThreshold * 0.35f)) {
+      // Sound decayed sharply within 45ms! Confirmed real physical impulse.
+      candidateImpulseActive = false;
+    }
+  }
+
+  // Re-arm when acoustic level decays back to quiet baseline
   if (!tapArmed) {
-    if ((knockDelta < (knockDeltaThreshold * 0.40f)) || ((now - lastTapTime) >= tapDebounceMs)) {
+    if ((knockDelta < (knockDeltaThreshold * 0.35f)) || ((now - lastTapTime) >= tapDebounceMs)) {
       tapArmed = true;
     }
   }
 
   // Detect genuine physical knock impulse:
-  // Must jump significantly above ambient background AND have a steep attack slope
-  if (tapArmed && (knockDelta >= knockDeltaThreshold) && (attackSlope >= tapAttackSlopeThreshold)) {
+  // 1. Must spike >= knockDeltaThreshold above current classroom background
+  // 2. Must have steep attack slope (instantaneous shockwave rise)
+  // 3. Must have high crest factor (sharp impulse vs diffuse crowd noise)
+  if (tapArmed && (knockDelta >= knockDeltaThreshold) && (attackSlope >= tapAttackSlopeThreshold) && (crestFactor >= 2.5f)) {
     if ((now - lastTapTime) >= tapDebounceMs) {
       lastTapTime = now;
-      tapArmed = false; // Disarm until signal decays or debounce window expires
+      tapOnsetMs = now;
+      candidateImpulseActive = true;
+      tapArmed = false; // Disarm until vibration dies down
       lastPeakEnergy = smoothedEnergy;
 
       if (!inTapWindow) {
