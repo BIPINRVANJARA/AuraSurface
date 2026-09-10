@@ -39,15 +39,17 @@ const uint16_t WS_PORT    = 8765;
 #define STATUS_LED    2
 
 // Acoustic Tap Detection Thresholds
-float knockDeltaThreshold     = 14500.0f; // Base height above ambient room noise
+float knockDeltaThreshold     = 8000.0f;  // Base height above ambient structural floor
 float tapAttackSlopeThreshold = 2200.0f;  // Instantaneous shockwave rise required for knock
 uint32_t tapDebounceMs        = 190;      // Lockout time to prevent desk vibration ring re-triggering
 uint32_t multiTapWindowMs     = 380;      // Max grouping window for double / triple taps (ms)
+const int MAX_KNOCK_ZCR       = 10;       // Desk knocks on wood have <= 10 zero crossings per 128 samples
+const float MIN_BAND_RATIO    = 1.35f;    // Low-pass (<350Hz) vibration MUST dominate high-pass airborne sound
 
 // Adaptive Ambient Noise Tracking & Dynamic Scaling
-float ambientNoiseFloor       = 6000.0f;  // Automatically tracks room background noise
-float baseKnockThreshold      = 12000.0f; // Calibrated floor margin
-float effectiveThreshold      = 14500.0f; // Dynamically adjusted based on real-time room volume
+float ambientNoiseFloor       = 3000.0f;  // Automatically tracks structural background noise
+float baseKnockThreshold      = 8000.0f;  // Calibrated floor margin
+float effectiveThreshold      = 8000.0f;  // Dynamically adjusted based on real-time room volume
 bool tapArmed                 = true;     // Re-arms when quiet or after debounce window
 bool soundDroppedBetweenTaps  = true;     // Rejects continuous speech/crowd from accumulating taps
 
@@ -97,7 +99,8 @@ WebSocketsServer wsServer(WS_PORT);
 // Tap Detector State
 int32_t dcOffset = 0;
 float smoothedEnergy = 0.0f;
-float prevEnergy = 0.0f;
+float smoothedLpEnergy = 0.0f;
+float prevLpEnergy = 0.0f;
 float lastPeakEnergy = 0.0f;
 uint32_t lastTapTime = 0;
 uint32_t windowStartTime = 0;
@@ -105,6 +108,15 @@ int currentTapCount = 0;
 bool inTapWindow = false;
 uint32_t lastTelemetryTime = 0;
 uint32_t lastWifiReconnect = 0;
+
+// Dual-Band Filter & Spectral Analysis States
+int32_t prevCleanSample = 0;
+float lpFilter1 = 0.0f;
+float lpFilter2 = 0.0f;
+int lastBatchZcr = 0;
+float lastBandRatio = 1.0f;
+float lastLpEnergy = 0.0f;
+float lastHpEnergy = 0.0f;
 
 // =============================================================================
 // I2S Driver Setup
@@ -151,71 +163,106 @@ void processAudioSamples(const int16_t* samples, size_t count) {
 
   float batchPeak = 0.0f;
   float batchSum = 0.0f;
+  float lpBatchPeak = 0.0f;
+  float lpBatchSum = 0.0f;
+  float hpBatchSum = 0.0f;
+  int zcr = 0;
 
   for (size_t i = 0; i < count; i++) {
     // High-pass DC offset rejection
     dcOffset = (dcOffset * 127 + samples[i]) / 128;
     int32_t clean = samples[i] - dcOffset;
-    float absVal = std::abs((float)clean);
+    float absClean = std::abs((float)clean);
 
-    if (absVal > batchPeak) batchPeak = absVal;
-    batchSum += absVal;
+    if (absClean > batchPeak) batchPeak = absClean;
+    batchSum += absClean;
+
+    // Zero-crossing rate: voice and music oscillate rapidly (ZCR > 15-60)
+    // Mechanical desk knocks are low-frequency thuds (ZCR <= 10)
+    if ((clean >= 0 && prevCleanSample < 0) || (clean < 0 && prevCleanSample >= 0)) {
+      zcr++;
+    }
+    prevCleanSample = clean;
+
+    // 2-pole IIR Low-Pass filter (< 350 Hz) for extracting solid desk mechanical vibrations
+    // At 16 kHz: alpha = 0.13
+    lpFilter1 += 0.13f * ((float)clean - lpFilter1);
+    lpFilter2 += 0.13f * (lpFilter1 - lpFilter2);
+    float lpVal = lpFilter2;
+    float hpVal = (float)clean - lpVal;
+
+    float absLp = std::abs(lpVal);
+    float absHp = std::abs(hpVal);
+
+    if (absLp > lpBatchPeak) lpBatchPeak = absLp;
+    lpBatchSum += absLp;
+    hpBatchSum += absHp;
   }
 
+  lastBatchZcr = zcr;
+  lastLpEnergy = lpBatchSum / count;
+  lastHpEnergy = hpBatchSum / count;
+  lastBandRatio = (hpBatchSum > 10.0f) ? (lpBatchSum / hpBatchSum) : 3.0f;
   float batchAvg = batchSum / count;
 
-  // Fast-attack envelope follower
+  // Envelope follower for low-frequency structural vibration
+  if (lpBatchPeak > smoothedLpEnergy) {
+    smoothedLpEnergy = (smoothedLpEnergy * 0.25f) + (lpBatchPeak * 0.75f);
+  } else {
+    smoothedLpEnergy = (smoothedLpEnergy * 0.85f) + (lastLpEnergy * 0.15f);
+  }
+
+  // Broadband envelope for telemetry
   if (batchPeak > smoothedEnergy) {
     smoothedEnergy = (smoothedEnergy * 0.25f) + (batchPeak * 0.75f);
   } else {
     smoothedEnergy = (smoothedEnergy * 0.85f) + (batchAvg * 0.15f);
   }
 
-  // Crest factor: peak-to-average ratio in this 8ms batch (impulsive knocks have high crest > 2.0)
-  float crestFactor = batchAvg > 10.0f ? (batchPeak / batchAvg) : 1.0f;
+  // Crest factor of structural vibration
+  float crestFactor = lastLpEnergy > 10.0f ? (lpBatchPeak / lastLpEnergy) : 1.0f;
 
   // ---------------------------------------------------------------------------
-  // STATE 1: CALIBRATING (Profile ambient noise floor & room chatter surges)
+  // STATE 1: CALIBRATING (Profile structural ambient floor & surges)
   // ---------------------------------------------------------------------------
   if (currentState == STATE_CALIBRATING) {
-    calibEnergySum += smoothedEnergy;
+    calibEnergySum += smoothedLpEnergy;
     calibSampleCount++;
-    if (smoothedEnergy > calibMaxEnergy) calibMaxEnergy = smoothedEnergy;
+    if (smoothedLpEnergy > calibMaxEnergy) calibMaxEnergy = smoothedLpEnergy;
 
-    if (smoothedEnergy < ambientNoiseFloor) {
-      ambientNoiseFloor = (ambientNoiseFloor * 0.90f) + (smoothedEnergy * 0.10f);
+    if (smoothedLpEnergy < ambientNoiseFloor) {
+      ambientNoiseFloor = (ambientNoiseFloor * 0.90f) + (smoothedLpEnergy * 0.10f);
     } else {
-      ambientNoiseFloor = (ambientNoiseFloor * 0.96f) + (smoothedEnergy * 0.04f);
+      ambientNoiseFloor = (ambientNoiseFloor * 0.96f) + (smoothedLpEnergy * 0.04f);
     }
 
-    float delta = smoothedEnergy - ambientNoiseFloor;
+    float delta = smoothedLpEnergy - ambientNoiseFloor;
     if (delta > calibMaxDelta) calibMaxDelta = delta;
 
-    prevEnergy = smoothedEnergy;
-    return; // Block all tap events while calibrating
+    prevLpEnergy = smoothedLpEnergy;
+    return; // Block tap events while calibrating
   }
 
   // ---------------------------------------------------------------------------
-  // STATE 2: RUNNING (Dynamic Sensitivity & Tap Recognition)
+  // STATE 2: RUNNING (Dynamic Sensitivity & Airborne Sound Immunity)
   // ---------------------------------------------------------------------------
-  // Dynamic scaling: increases threshold if the room gets louder, lowers when quiet
   effectiveThreshold = std::max(baseKnockThreshold, ambientNoiseFloor * 1.25f);
   knockDeltaThreshold = effectiveThreshold;
 
-  // Track room ambient noise floor when not in tap impulse
+  // Track room ambient structural noise floor when not in tap impulse
   if (tapArmed) {
-    if (smoothedEnergy < ambientNoiseFloor) {
-      ambientNoiseFloor = (ambientNoiseFloor * 0.90f) + (smoothedEnergy * 0.10f); // Quick catch-down when quiet
+    if (smoothedLpEnergy < ambientNoiseFloor) {
+      ambientNoiseFloor = (ambientNoiseFloor * 0.90f) + (smoothedLpEnergy * 0.10f);
     } else {
-      ambientNoiseFloor = (ambientNoiseFloor * 0.980f) + (smoothedEnergy * 0.020f); // Fast tracking of crowd volume
+      ambientNoiseFloor = (ambientNoiseFloor * 0.980f) + (smoothedLpEnergy * 0.020f);
     }
   }
 
-  float attackSlope = smoothedEnergy - prevEnergy;
-  prevEnergy = smoothedEnergy;
+  float attackSlope = smoothedLpEnergy - prevLpEnergy;
+  prevLpEnergy = smoothedLpEnergy;
 
-  // Impulse height above current ambient room noise floor
-  float knockDelta = smoothedEnergy - ambientNoiseFloor;
+  // Mechanical impulse height above baseline
+  float knockDelta = smoothedLpEnergy - ambientNoiseFloor;
   if (knockDelta < 0.0f) knockDelta = 0.0f;
 
   uint32_t now = millis();
@@ -228,23 +275,28 @@ void processAudioSamples(const int16_t* samples, size_t count) {
     tapArmed = true;
   }
 
-  // Detect genuine physical knock impulse:
-  // 1. Must jump significantly above dynamic ambient background (knockDelta >= effectiveThreshold)
-  // 2. Must have steep attack slope (shockwave rise >= tapAttackSlopeThreshold)
-  // 3. Must have impulsive crest factor (crestFactor >= 1.9f)
-  if (tapArmed && (knockDelta >= effectiveThreshold) && (attackSlope >= tapAttackSlopeThreshold) && (crestFactor >= 1.9f)) {
+  // Detect genuine physical desk knock:
+  // 1. Must spike above structural baseline (knockDelta >= effectiveThreshold)
+  // 2. Must have steep shockwave attack (attackSlope >= tapAttackSlopeThreshold)
+  // 3. Must have impulsive crest factor (crestFactor >= 1.8f)
+  // 4. Must be LOW FREQUENCY: ZCR <= 10 (Voice & Music have ZCR 20-60+)
+  // 5. Low-pass structural energy must dominate airborne high-pass: lastBandRatio >= 1.35f
+  bool isMechanicalImpulse = (knockDelta >= effectiveThreshold) &&
+                             (attackSlope >= tapAttackSlopeThreshold) &&
+                             (crestFactor >= 1.8f) &&
+                             (zcr <= MAX_KNOCK_ZCR) &&
+                             (lastBandRatio >= MIN_BAND_RATIO);
+
+  if (tapArmed && isMechanicalImpulse) {
     if ((now - lastTapTime) >= tapDebounceMs) {
-      // CROWD NOISE IMMUNITY:
-      // For multi-taps (2nd or 3rd knock), require that sound dropped towards baseline between knocks!
-      // Continuous speech, cheering, or crowd noise never drops, so it can NEVER accumulate multiple taps!
       if (inTapWindow && !soundDroppedBetweenTaps) {
-        return; // Ignore continuous crowd noise
+        return; // Continuous sound rejection
       }
 
       lastTapTime = now;
       tapArmed = false;
-      soundDroppedBetweenTaps = false; // Must drop before next tap is accepted
-      lastPeakEnergy = smoothedEnergy;
+      soundDroppedBetweenTaps = false;
+      lastPeakEnergy = smoothedLpEnergy;
 
       if (!inTapWindow) {
         inTapWindow = true;
@@ -488,12 +540,12 @@ void loop() {
   // Telemetry stream (every 50ms) for real-time visual calibration
   if (now - lastTelemetryTime >= 50) {
     lastTelemetryTime = now;
-    float delta = smoothedEnergy - ambientNoiseFloor;
-    char telemBuf[160];
+    float delta = smoothedLpEnergy - ambientNoiseFloor;
+    char telemBuf[200];
     snprintf(telemBuf, sizeof(telemBuf),
-             "{\"type\":\"TELEMETRY\",\"state\":\"%s\",\"energy\":%.1f,\"floor\":%.1f,\"delta\":%.1f,\"threshold\":%.1f}",
+             "{\"type\":\"TELEMETRY\",\"state\":\"%s\",\"energy\":%.1f,\"lp\":%.1f,\"zcr\":%d,\"ratio\":%.2f,\"floor\":%.1f,\"delta\":%.1f,\"threshold\":%.1f}",
              currentState == STATE_CALIBRATING ? "CALIBRATING" : "RUNNING",
-             smoothedEnergy, ambientNoiseFloor, delta, effectiveThreshold);
+             smoothedEnergy, smoothedLpEnergy, lastBatchZcr, lastBandRatio, ambientNoiseFloor, delta, effectiveThreshold);
     wsServer.broadcastTXT(telemBuf);
   }
 
