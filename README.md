@@ -1,4 +1,5 @@
-# 🖐️ OmniTouch AI — Haptic Surface & Voice Controller
+# 🪵 AuraSurface — Spatial HCI & Acoustic Surface Controller
+*(Formerly OmniTouch AI)*
 
 Transform ordinary desks and surfaces into programmable human-computer interfaces using acoustic vibration sensing, voice commands, and zero-latency Windows PC automation.
 
